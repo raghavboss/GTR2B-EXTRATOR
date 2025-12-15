@@ -1,7 +1,9 @@
 
 import React, { createContext, useContext, useState, useEffect } from 'react';
 import { User, Role, Permission, Ledger } from '../types';
-import { getUserByEmail, getAllRoles, initDB, getAllLedgers, logAudit, seedJaipurData, seedJodhpurData } from '../utils/db'; // initDB to ensure seeding
+import { getUserByEmail, getAllRoles, initDB, getAllLedgers, logAudit, seedJaipurData, seedJodhpurData, saveUser } from '../utils/db';
+import { auth } from '../utils/firebase';
+import { signInWithEmailAndPassword, signOut, onAuthStateChanged, createUserWithEmailAndPassword, User as FirebaseUser } from 'firebase/auth';
 
 interface AuthContextType {
   currentUser: User | null;
@@ -22,106 +24,151 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const [currentExternalUser, setCurrentExternalUser] = useState<Ledger | null>(null);
   const [isLoading, setIsLoading] = useState(true);
 
-  // Load session from localStorage on mount
+  // Initialize DB and Seed Data
   useEffect(() => {
-    const loadSession = async () => {
-      // Ensure DB is initialized (and seeded)
-      try {
-        await initDB();
-        
-        // Auto-seed mock data for convenience
-        await seedJaipurData();
-        await seedJodhpurData();
-
-        // Check Internal User Session
-        const storedUser = localStorage.getItem('erp_session_user');
-        if (storedUser) {
-            const user: User = JSON.parse(storedUser);
-            // Verify user still exists and get latest role
-            const dbUser = await getUserByEmail(user.email);
-            if (dbUser && dbUser.isActive) {
-                setCurrentUser(dbUser);
-                const roles = await getAllRoles();
-                const role = roles.find(r => r.id === dbUser.roleId) || null;
-                setCurrentRole(role);
-            } else {
-                localStorage.removeItem('erp_session_user');
-            }
+    const initSystem = async () => {
+        try {
+            await initDB();
+            await seedJaipurData();
+            await seedJodhpurData();
+        } catch (e) {
+            console.error("System Initialization Failed", e);
         }
-
-        // Check External Ledger Session
-        const storedLedger = localStorage.getItem('erp_session_ledger');
-        if (storedLedger) {
-            const ledger: Ledger = JSON.parse(storedLedger);
-            // Verify ledger exists
-            const ledgers = await getAllLedgers();
-            const dbLedger = ledgers.find(l => l.id === ledger.id);
-            if(dbLedger && dbLedger.portalEmail && dbLedger.portalPassword) {
-                setCurrentExternalUser(dbLedger);
-            } else {
-                localStorage.removeItem('erp_session_ledger');
-            }
-        }
-
-      } catch (e) {
-          console.error("Session load failed", e);
-      } finally {
-          setIsLoading(false);
-      }
     };
-    loadSession();
+    initSystem();
+  }, []);
+
+  // Monitor Firebase Auth State
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, async (firebaseUser: FirebaseUser | null) => {
+        if (firebaseUser) {
+            // User is signed in.
+            // 1. Check if user exists in local IDB
+            try {
+                const email = firebaseUser.email!;
+                let dbUser = await getUserByEmail(email);
+
+                // If user authenticated in Firebase but not in IDB (e.g., cleared browser data),
+                // we might want to recreate them locally if they were the default admin,
+                // or deny access. For this app, if it's the admin email, we ensure it exists.
+                if (!dbUser && email === 'admin@corp.com') {
+                    // Re-seed default admin if missing locally but present in auth
+                    // This logic is handled by initDB usually, but let's be safe.
+                    // For now, assume idb handles persistence.
+                }
+
+                if (dbUser && dbUser.isActive) {
+                    setCurrentUser(dbUser);
+                    const roles = await getAllRoles();
+                    const role = roles.find(r => r.id === dbUser.roleId) || null;
+                    setCurrentRole(role);
+                    
+                    // Audit Log (Session Restore)
+                    // We don't log every refresh, but we could.
+                } else {
+                    // Valid firebase user but invalid local user (disabled or deleted)
+                    console.warn("Firebase user exists but local user is missing or inactive.");
+                    await signOut(auth);
+                    setCurrentUser(null);
+                    setCurrentRole(null);
+                }
+            } catch (err) {
+                console.error("Error fetching user details", err);
+            }
+        } else {
+            // User is signed out.
+            setCurrentUser(null);
+            setCurrentRole(null);
+        }
+        setIsLoading(false);
+    });
+
+    return () => unsubscribe();
   }, []);
 
   const login = async (email: string, password: string) => {
     try {
-      const user = await getUserByEmail(email);
-      
-      // In a real app, use bcrypt.compare(password, user.passwordHash)
-      if (user && user.passwordHash === password) {
-        if (!user.isActive) {
-            return { success: false, error: 'Account is deactivated. Contact admin.' };
-        }
+        // Attempt Firebase Login
+        await signInWithEmailAndPassword(auth, email, password);
         
-        const roles = await getAllRoles();
-        const role = roles.find(r => r.id === user.roleId) || null;
-
-        setCurrentUser(user);
-        setCurrentRole(role);
-        setCurrentExternalUser(null); // Clear external session if any
-        localStorage.setItem('erp_session_user', JSON.stringify(user));
-        localStorage.removeItem('erp_session_ledger');
-
-        // Audit Log
-        logAudit({
-            userId: user.id || 0,
-            userName: user.name,
-            action: 'LOGIN',
-            module: 'Authentication',
-            description: `User logged in successfully.`
-        });
+        // If successful, onAuthStateChanged will handle state update.
+        // We fetch the user here just to log the audit event immediately if needed,
+        // but onAuthStateChanged is the source of truth.
+        
+        // Fetch user to log audit
+        const user = await getUserByEmail(email);
+        if (user) {
+             logAudit({
+                userId: user.id || 0,
+                userName: user.name,
+                action: 'LOGIN',
+                module: 'Authentication',
+                description: `User logged in via Firebase.`
+            });
+        }
 
         return { success: true };
-      }
-      return { success: false, error: 'Invalid email or password' };
-    } catch (error) {
-      console.error("Login error", error);
-      return { success: false, error: 'System error during login' };
+    } catch (error: any) {
+        console.error("Firebase Login Error", error);
+
+        // Auto-provisioning Logic for Demo/First-Run convenience
+        // auth/invalid-credential is the new generic error that can mean "User not found" 
+        // OR "Wrong password" if enumeration protection is on.
+        if (error.code === 'auth/user-not-found' || error.code === 'auth/invalid-credential' || error.code === 'auth/wrong-password') {
+            // Check if this user exists in our Local DB (seeded user)
+            const localUser = await getUserByEmail(email);
+            
+            if (localUser) {
+                // User exists locally. Try to create them in Firebase.
+                // If they truly exist in Firebase and password was wrong, createUser will fail with email-already-in-use.
+                // If they don't exist in Firebase (first run), this will succeed and log them in.
+                try {
+                    await createUserWithEmailAndPassword(auth, email, password);
+                    
+                    // Sync: Update local user password hash if needed (though we rely on firebase now)
+                    // localUser.passwordHash = password; // Optional sync
+                    // await saveUser(localUser);
+
+                    logAudit({
+                        userId: localUser.id || 0,
+                        userName: localUser.name,
+                        action: 'CREATE',
+                        module: 'Authentication',
+                        description: `Auto-provisioned Firebase account for local user.`
+                    });
+
+                    return { success: true };
+                } catch (createError: any) {
+                    console.error("Auto-provisioning failed", createError);
+                    
+                    if (createError.code === 'auth/email-already-in-use') {
+                        // This confirms the user exists in Firebase, so the original error was indeed a wrong password.
+                        return { success: false, error: 'Invalid password' };
+                    }
+                    
+                    return { success: false, error: createError.message };
+                }
+            }
+        }
+
+        return { success: false, error: error.message };
     }
   };
 
   const loginExternal = async (email: string, password: string) => {
+      // External users (Partners) still use IDB Ledgers for now as per "simple auth" scope usually applying to main app users.
+      // If needed, we could migrate them to Firebase too, but they are dynamically created ledgers.
       try {
           const ledgers = await getAllLedgers();
           const ledger = ledgers.find(l => l.portalEmail === email && l.portalPassword === password);
 
           if (ledger) {
               setCurrentExternalUser(ledger);
-              setCurrentUser(null); // Clear internal session
+              setCurrentUser(null); 
               setCurrentRole(null);
-              localStorage.setItem('erp_session_ledger', JSON.stringify(ledger));
-              localStorage.removeItem('erp_session_user');
+              // Ensure firebase is signed out so we don't have mixed states
+              await signOut(auth);
 
-              // Audit Log (External)
               logAudit({
                 userId: `EXT-${ledger.id}`,
                 userName: ledger.name,
@@ -139,7 +186,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       }
   };
 
-  const logout = () => {
+  const logout = async () => {
     if (currentUser) {
         logAudit({
             userId: currentUser.id || 0,
@@ -148,6 +195,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
             module: 'Authentication',
             description: `User logged out.`
         });
+        await signOut(auth);
     } else if (currentExternalUser) {
         logAudit({
             userId: `EXT-${currentExternalUser.id}`,
@@ -156,17 +204,14 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
             module: 'Partner Portal',
             description: `Partner logged out.`
         });
+        setCurrentExternalUser(null);
     }
-
-    setCurrentUser(null);
-    setCurrentRole(null);
-    setCurrentExternalUser(null);
-    localStorage.removeItem('erp_session_user');
-    localStorage.removeItem('erp_session_ledger');
+    
+    // State is cleared by onAuthStateChanged for currentUser
   };
 
   const hasPermission = (permission: Permission): boolean => {
-    if (currentExternalUser) return false; // External users have no internal permissions
+    if (currentExternalUser) return false;
     if (!currentRole) return false;
     if (currentRole.id === 'super_admin') return true;
     return currentRole.permissions.includes(permission);
